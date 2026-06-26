@@ -1,0 +1,71 @@
+openers:
+  md:
+    command: "mdcat {file}"
+    mode: "kitty-window"
+  c: "vi {file}"
+  cc: "vi {file}"
+  cpp: "vi {file}"
+  cs: "vi {file}"
+  css: "vi {file}"
+  dart: "vi {file}"
+  dockerfile: "vi {file}"
+  go: "vi {file}"
+  h: "vi {file}"
+  hpp: "vi {file}"
+  html: "vi {file}"
+  avif:
+    command: "kitten icat {path}"
+    mode: "kitty-overlay"
+    wait: true
+  bmp:
+    command: "kitten icat {path}"
+    mode: "kitty-overlay"
+    wait: true
+  gif:
+    command: "kitten icat {path}"
+    mode: "kitty-overlay"
+    wait: true
+  java: "vi {file}"
+  jpeg:
+    command: "kitten icat {path}"
+    mode: "kitty-overlay"
+    wait: true
+  js: "vi {file}"
+  json: "vi {file}"
+  jpg:
+    command: "kitten icat {path}"
+    mode: "kitty-overlay"
+    wait: true
+  jsx: "vi {file}"
+  kt: "vi {file}"
+  kts: "vi {file}"
+  lua: "vi {file}"
+  pdf: "webcat {path}"
+  php: "vi {file}"
+  png:
+    command: "kitten icat {path}"
+    mode: "kitty-overlay"
+    wait: true
+  py: "vi {file}"
+  rb: "vi {file}"
+  rs: "vi {file}"
+  scala: "vi {file}"
+  sh: "vi {file}"
+  sql: "vi {file}"
+  swift: "vi {file}"
+  toml: "vi {file}"
+  ts: "vi {file}"
+  tsx: "vi {file}"
+  tiff:
+    command: "kitten icat {path}"
+    mode: "kitty-overlay"
+    wait: true
+  vim: "vi {file}"
+  vue: "vi {file}"
+  webp:
+    command: "kitten icat {path}"
+    mode: "kitty-overlay"
+    wait: true
+  yaml: "vi {file}"
+  yml: "vi {file}"
+  zsh: "vi {file}"

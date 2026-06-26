@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Publish release and Homebrew formula
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify
+        run: cargo test --locked
+
+      - name: Package source
+        id: package
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          ARCHIVE="lscat-${VERSION}.tar.gz"
+          PREFIX="lscat-${VERSION}/"
+          mkdir -p dist
+          git archive --format=tar --prefix="${PREFIX}" HEAD | gzip -n > "dist/${ARCHIVE}"
+          SHA256="$(sha256sum "dist/${ARCHIVE}" | awk '{print $1}')"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "archive=${ARCHIVE}" >> "$GITHUB_OUTPUT"
+          echo "sha256=${SHA256}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" "dist/${{ steps.package.outputs.archive }}" --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" "dist/${{ steps.package.outputs.archive }}" --generate-notes
+          fi
+
+      - name: Update Homebrew tap
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ steps.package.outputs.version }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+          SHA256: ${{ steps.package.outputs.sha256 }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          test -n "${TAP_TOKEN}"
+          rm -rf /tmp/lscat-homebrew-tap
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/hoonkim/homebrew-tap.git" /tmp/lscat-homebrew-tap
+          cd /tmp/lscat-homebrew-tap
+          TAP_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+          mkdir -p Formula
+          cat > Formula/lscat.rb <<EOF
+          class Lscat < Formula
+            desc "Rust terminal file explorer designed for kitty"
+            homepage "https://github.com/${SOURCE_REPOSITORY}"
+            url "https://github.com/${SOURCE_REPOSITORY}/releases/download/v${VERSION}/${ARCHIVE}"
+            sha256 "${SHA256}"
+            license :cannot_represent
+
+            depends_on "rust" => :build
+
+            def install
+              system "cargo", "install", *std_cargo_args
+              zsh_function.install "shell/lscat.zsh"
+            end
+
+            test do
+              assert_match "lscat - terminal file explorer", shell_output("#{bin}/lscat --help")
+            end
+          end
+          EOF
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/lscat.rb
+          git commit -m "lscat ${VERSION}" || exit 0
+          git push origin "HEAD:${TAP_BRANCH}"
