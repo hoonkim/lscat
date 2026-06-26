@@ -15,8 +15,7 @@ cargo install --path .
 Or install from Homebrew:
 
 ```sh
-brew tap hoonkim/tap
-brew install lscat
+brew install hoonkim/tap/lscat
 ```
 
 ## Release
