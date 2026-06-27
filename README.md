@@ -21,19 +21,6 @@ Or install from Homebrew:
 brew install hoonkim/tap/lscat
 ```
 
-## Release
-
-The release workflow runs when a `v*` tag is pushed:
-
-```sh
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-It publishes a source archive, then updates `hoonkim/homebrew-tap` with a
-formula that builds lscat with Cargo during `brew install`. The repository must
-have a `HOMEBREW_TAP_TOKEN` secret with write access to that tap.
-
 ## Shell integration
 
 Add this to `~/.zshrc` if you want `lscat` itself to change your shell's
