@@ -116,6 +116,7 @@ Double click   Open selected directory
 Right click    Go to parent directory
 Wheel          Scroll file list
 Up/Down, k/j   Move selection
+u              Toggle hidden files
 /              Search in current directory
 Up/Down in /   Move within search results
 !COMMAND       Run command here, then return to lscat

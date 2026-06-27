@@ -119,6 +119,7 @@ fn print_help() {
            lscat [--print-cwd] [--spawn-shell] [--output FILE] [START_DIR]\n\n\
          Keys:\n\
            Up/Down, k/j   Move selection\n\
+           u              Toggle hidden files\n\
            /              Search in current directory\n\
            !COMMAND       Run command here, then return to lscat\n\
            Enter, l       Open selected directory\n\
@@ -272,6 +273,7 @@ struct App {
     cwd: PathBuf,
     config: AppConfig,
     entries: Vec<Entry>,
+    show_hidden: bool,
     selected: usize,
     scroll: usize,
     last_click: Option<(usize, Instant)>,
@@ -298,6 +300,7 @@ impl App {
             cwd,
             config,
             entries: Vec::new(),
+            show_hidden: false,
             selected: 0,
             scroll: 0,
             last_click: None,
@@ -397,15 +400,12 @@ impl App {
 
     fn filtered_indices(&self) -> Vec<usize> {
         let query = self.search.trim().to_lowercase();
-        if query.is_empty() {
-            return (0..self.entries.len()).collect();
-        }
-
         self.entries
             .iter()
             .enumerate()
+            .filter(|(_, entry)| self.show_hidden || !entry.hidden)
             .filter_map(|(index, entry)| {
-                entry.name.to_lowercase().contains(&query).then_some(index)
+                (query.is_empty() || entry.name.to_lowercase().contains(&query)).then_some(index)
             })
             .collect()
     }
@@ -419,6 +419,30 @@ impl App {
         self.selected = 0;
         self.scroll = 0;
         self.last_click = None;
+    }
+
+    fn toggle_hidden(&mut self) {
+        let selected_name = self.selected_entry().map(|entry| entry.name.clone());
+        self.show_hidden = !self.show_hidden;
+        self.selected = 0;
+        self.scroll = 0;
+        self.last_click = None;
+
+        if let Some(selected_name) = selected_name {
+            if let Some(index) = self
+                .filtered_indices()
+                .iter()
+                .position(|entry_index| self.entries[*entry_index].name == selected_name)
+            {
+                self.selected = index;
+            }
+        }
+
+        self.message = Some(if self.show_hidden {
+            "showing hidden files".to_string()
+        } else {
+            "hiding hidden files".to_string()
+        });
     }
 
     fn open_selected(&mut self) {
@@ -868,6 +892,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
         (KeyCode::Up, _) | (KeyCode::Char('k'), _) => app.move_by(-1),
         (KeyCode::Char('g'), _) => app.first(),
         (KeyCode::Char('G'), _) => app.last(),
+        (KeyCode::Char('u'), _) => app.toggle_hidden(),
         (KeyCode::Enter, _) | (KeyCode::Right, _) | (KeyCode::Char('l'), _) => app.open_selected(),
         (KeyCode::Backspace, _) | (KeyCode::Left, _) | (KeyCode::Char('h'), _) => app.parent(),
         (KeyCode::Char('r'), _) => {
@@ -1184,7 +1209,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )
     } else {
         app.message.clone().unwrap_or_else(|| {
-            "/ search  ! command  Click select  Double-click open  Wheel scroll  Esc/q close"
+            "/ search  u hidden  ! command  Click select  Double-click open  Wheel scroll  Esc/q close"
                 .to_string()
         })
     };
