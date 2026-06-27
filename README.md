@@ -11,7 +11,8 @@ renamed, or modified.
 
 Inside a Git worktree, staged files are shown in green and modified or
 untracked files are shown in red. The right pane also shows branch and status
-details, with mouse-wheel scrolling when the list is long.
+details, with mouse-wheel scrolling when the list is long. Click a file in the
+Git status panel to jump to its directory and select it in the file list.
 
 ## Install
 

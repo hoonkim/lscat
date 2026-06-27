@@ -395,7 +395,8 @@ impl App {
     }
 
     fn ensure_selected_visible(&mut self, visible_rows: usize) {
-        if visible_rows == 0 || self.filtered_len() == 0 {
+        let len = self.filtered_len();
+        if visible_rows == 0 || len == 0 {
             self.scroll = 0;
             return;
         }
@@ -405,6 +406,7 @@ impl App {
         } else if self.selected >= self.scroll + visible_rows {
             self.scroll = self.selected + 1 - visible_rows;
         }
+        self.scroll = cmp::min(self.scroll, len.saturating_sub(visible_rows));
     }
 
     fn first(&mut self) {
@@ -421,6 +423,26 @@ impl App {
     fn selected_entry(&self) -> Option<&Entry> {
         let index = self.filtered_indices().get(self.selected).copied()?;
         self.entries.get(index)
+    }
+
+    fn select_entry_named(&mut self, name: &str) {
+        if let Some(entry_index) = self.entries.iter().position(|entry| entry.name == name) {
+            if self.entries[entry_index].hidden {
+                self.show_hidden = true;
+            }
+
+            self.selected = self
+                .entries
+                .iter()
+                .take(entry_index)
+                .filter(|entry| self.show_hidden || !entry.hidden)
+                .count();
+        }
+    }
+
+    fn clear_search_filter(&mut self) {
+        self.search_active = false;
+        self.search.clear();
     }
 
     fn filtered_indices(&self) -> Vec<usize> {
@@ -489,6 +511,46 @@ impl App {
         if let Err(err) = self.change_dir(path) {
             self.message = Some(err.to_string());
         }
+    }
+
+    fn jump_to_git_path(&mut self, git_path: &str, visible_rows: usize) {
+        let Some(root) = self.git_status.as_ref().map(|status| status.root.clone()) else {
+            return;
+        };
+        let full_path = root.join(git_path);
+
+        self.clear_search_filter();
+
+        if full_path.is_dir() {
+            if let Err(err) = self.change_dir(full_path) {
+                self.message = Some(err.to_string());
+            }
+            self.clear_search_filter();
+            return;
+        }
+
+        let Some(parent) = full_path.parent().map(Path::to_path_buf) else {
+            return;
+        };
+        let Some(file_name) = full_path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+        else {
+            return;
+        };
+
+        if file_name.starts_with('.') {
+            self.show_hidden = true;
+        }
+
+        if let Err(err) = self.change_dir(parent) {
+            self.message = Some(err.to_string());
+            return;
+        }
+
+        self.clear_search_filter();
+        self.select_entry_named(&file_name);
+        self.ensure_selected_visible(visible_rows);
     }
 
     fn parent(&mut self) {
@@ -594,10 +656,12 @@ impl GitStatus {
             style: Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
+            path: None,
         });
         lines.push(GitStatusLine {
             label: format!("staged {staged}  modified {modified}"),
             style: Style::default().fg(Color::Gray),
+            path: None,
         });
 
         if staged > 0 {
@@ -606,11 +670,13 @@ impl GitStatus {
                 style: Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
+                path: None,
             });
             for change in self.changes.iter().filter(|change| change.staged) {
                 lines.push(GitStatusLine {
                     label: format!("S {}", change.path),
                     style: Style::default().fg(Color::Green),
+                    path: Some(change.path.clone()),
                 });
             }
         }
@@ -619,11 +685,13 @@ impl GitStatus {
             lines.push(GitStatusLine {
                 label: "modified".to_string(),
                 style: Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                path: None,
             });
             for change in self.changes.iter().filter(|change| change.modified) {
                 lines.push(GitStatusLine {
                     label: format!("M {}", change.path),
                     style: Style::default().fg(Color::Red),
+                    path: Some(change.path.clone()),
                 });
             }
         }
@@ -632,6 +700,7 @@ impl GitStatus {
             lines.push(GitStatusLine {
                 label: "clean".to_string(),
                 style: Style::default().fg(Color::Green),
+                path: None,
             });
         }
 
@@ -643,6 +712,7 @@ impl GitStatus {
 struct GitStatusLine {
     label: String,
     style: Style,
+    path: Option<String>,
 }
 
 fn read_git_status(cwd: &Path) -> Result<Option<GitStatus>> {
@@ -1191,6 +1261,15 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, layout: UiLayout) -> Result<bo
 
                     if is_double_click {
                         app.open_selected();
+                    }
+                }
+            } else if let Some(area) = layout.git {
+                if let Some(index) = row_at(area, app.git_scroll, mouse.column, mouse.row) {
+                    if let Some(status) = app.git_status.as_ref() {
+                        let lines = status.display_lines();
+                        if let Some(path) = lines.get(index).and_then(|line| line.path.clone()) {
+                            app.jump_to_git_path(&path, visible_rows);
+                        }
                     }
                 }
             }
