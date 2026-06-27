@@ -768,11 +768,12 @@ fn run_app(app: &mut App) -> Result<PathBuf> {
 struct DirectoryWatcher {
     watcher: RecommendedWatcher,
     rx: Receiver<notify::Result<notify::Event>>,
-    path: PathBuf,
+    cwd: PathBuf,
+    git_root: Option<PathBuf>,
 }
 
 impl DirectoryWatcher {
-    fn new(path: &Path) -> Result<Self> {
+    fn new(cwd: &Path, git_root: Option<&Path>) -> Result<Self> {
         let (tx, rx) = mpsc::channel();
         let mut watcher = RecommendedWatcher::new(
             move |event| {
@@ -782,28 +783,50 @@ impl DirectoryWatcher {
         )
         .context("failed to create filesystem watcher")?;
         watcher
-            .watch(path, RecursiveMode::NonRecursive)
-            .with_context(|| format!("failed to watch {}", path.display()))?;
+            .watch(cwd, RecursiveMode::NonRecursive)
+            .with_context(|| format!("failed to watch {}", cwd.display()))?;
+
+        let git_root = git_root.map(Path::to_path_buf);
+        if let Some(root) = git_root.as_ref().filter(|root| root.as_path() != cwd) {
+            watcher
+                .watch(root, RecursiveMode::Recursive)
+                .with_context(|| format!("failed to watch git root {}", root.display()))?;
+        }
 
         Ok(Self {
             watcher,
             rx,
-            path: path.to_path_buf(),
+            cwd: cwd.to_path_buf(),
+            git_root,
         })
     }
 
-    fn sync_path(&mut self, path: &Path) -> Result<()> {
-        if self.path == path {
+    fn sync_paths(&mut self, cwd: &Path, git_root: Option<&Path>) -> Result<()> {
+        let next_git_root = git_root.map(Path::to_path_buf);
+        if self.cwd == cwd && self.git_root == next_git_root {
             return Ok(());
         }
 
         self.watcher
-            .unwatch(&self.path)
-            .with_context(|| format!("failed to unwatch {}", self.path.display()))?;
+            .unwatch(&self.cwd)
+            .with_context(|| format!("failed to unwatch {}", self.cwd.display()))?;
+        if let Some(root) = self.git_root.as_ref().filter(|root| *root != &self.cwd) {
+            self.watcher
+                .unwatch(root)
+                .with_context(|| format!("failed to unwatch git root {}", root.display()))?;
+        }
+
         self.watcher
-            .watch(path, RecursiveMode::NonRecursive)
-            .with_context(|| format!("failed to watch {}", path.display()))?;
-        self.path = path.to_path_buf();
+            .watch(cwd, RecursiveMode::NonRecursive)
+            .with_context(|| format!("failed to watch {}", cwd.display()))?;
+        if let Some(root) = next_git_root.as_ref().filter(|root| root.as_path() != cwd) {
+            self.watcher
+                .watch(root, RecursiveMode::Recursive)
+                .with_context(|| format!("failed to watch git root {}", root.display()))?;
+        }
+
+        self.cwd = cwd.to_path_buf();
+        self.git_root = next_git_root;
         self.drain();
         Ok(())
     }
@@ -817,6 +840,10 @@ impl DirectoryWatcher {
         }
         changed
     }
+}
+
+fn git_root(app: &App) -> Option<&Path> {
+    app.git_status.as_ref().map(|status| status.root.as_path())
 }
 
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stderr>>> {
@@ -848,13 +875,16 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stderr>>) -> Result
 }
 
 fn app_loop(terminal: &mut Terminal<CrosstermBackend<Stderr>>, app: &mut App) -> Result<PathBuf> {
-    let mut directory_watcher = DirectoryWatcher::new(&app.cwd)?;
+    let mut directory_watcher = DirectoryWatcher::new(&app.cwd, git_root(app))?;
 
     loop {
         terminal.draw(|frame| draw(frame, app))?;
 
         if directory_watcher.drain() {
             if let Err(err) = app.refresh() {
+                app.message = Some(err.to_string());
+            }
+            if let Err(err) = directory_watcher.sync_paths(&app.cwd, git_root(app)) {
                 app.message = Some(err.to_string());
             }
         }
@@ -877,7 +907,7 @@ fn app_loop(terminal: &mut Terminal<CrosstermBackend<Stderr>>, app: &mut App) ->
                     KeyAction::Quit => return Ok(app.cwd.clone()),
                 }
                 run_pending_command(terminal, app);
-                if let Err(err) = directory_watcher.sync_path(&app.cwd) {
+                if let Err(err) = directory_watcher.sync_paths(&app.cwd, git_root(app)) {
                     app.message = Some(err.to_string());
                 }
                 app.ensure_selected_visible(visible_rows);
@@ -887,7 +917,7 @@ fn app_loop(terminal: &mut Terminal<CrosstermBackend<Stderr>>, app: &mut App) ->
                     return Ok(app.cwd.clone());
                 }
                 run_pending_command(terminal, app);
-                if let Err(err) = directory_watcher.sync_path(&app.cwd) {
+                if let Err(err) = directory_watcher.sync_paths(&app.cwd, git_root(app)) {
                     app.message = Some(err.to_string());
                 }
             }
