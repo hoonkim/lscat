@@ -6,6 +6,9 @@ It opens at the current working directory by default. When used through a shell
 function, pressing `Esc` or `q` closes the explorer and changes the parent shell
 to the directory currently shown in the UI.
 
+The visible directory refreshes automatically when files are created, removed,
+renamed, or modified.
+
 ## Install
 
 ```sh

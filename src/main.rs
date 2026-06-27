@@ -5,6 +5,7 @@ use std::{
     io::{self, Stderr, Write},
     path::{Path, PathBuf},
     process::Command,
+    sync::mpsc::{self, Receiver},
     time::{Duration, Instant},
 };
 
@@ -12,12 +13,13 @@ use anyhow::{Context, Result};
 use crossterm::{
     cursor,
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-        MouseButton, MouseEvent, MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event as TerminalEvent, KeyCode, KeyEvent,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -311,6 +313,7 @@ impl App {
     }
 
     fn refresh(&mut self) -> Result<()> {
+        let selected_name = self.selected_entry().map(|entry| entry.name.clone());
         self.entries = read_entries(&self.cwd)?;
         let len = self.filtered_len();
         if len == 0 {
@@ -319,6 +322,15 @@ impl App {
         } else {
             self.selected = cmp::min(self.selected, len - 1);
             self.scroll = cmp::min(self.scroll, len - 1);
+            if let Some(selected_name) = selected_name {
+                if let Some(index) = self
+                    .filtered_indices()
+                    .iter()
+                    .position(|entry_index| self.entries[*entry_index].name == selected_name)
+                {
+                    self.selected = index;
+                }
+            }
         }
         Ok(())
     }
@@ -515,6 +527,60 @@ fn run_app(app: &mut App) -> Result<PathBuf> {
     result
 }
 
+struct DirectoryWatcher {
+    watcher: RecommendedWatcher,
+    rx: Receiver<notify::Result<notify::Event>>,
+    path: PathBuf,
+}
+
+impl DirectoryWatcher {
+    fn new(path: &Path) -> Result<Self> {
+        let (tx, rx) = mpsc::channel();
+        let mut watcher = RecommendedWatcher::new(
+            move |event| {
+                let _ = tx.send(event);
+            },
+            NotifyConfig::default(),
+        )
+        .context("failed to create filesystem watcher")?;
+        watcher
+            .watch(path, RecursiveMode::NonRecursive)
+            .with_context(|| format!("failed to watch {}", path.display()))?;
+
+        Ok(Self {
+            watcher,
+            rx,
+            path: path.to_path_buf(),
+        })
+    }
+
+    fn sync_path(&mut self, path: &Path) -> Result<()> {
+        if self.path == path {
+            return Ok(());
+        }
+
+        self.watcher
+            .unwatch(&self.path)
+            .with_context(|| format!("failed to unwatch {}", self.path.display()))?;
+        self.watcher
+            .watch(path, RecursiveMode::NonRecursive)
+            .with_context(|| format!("failed to watch {}", path.display()))?;
+        self.path = path.to_path_buf();
+        self.drain();
+        Ok(())
+    }
+
+    fn drain(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(event) = self.rx.try_recv() {
+            if event.is_ok() {
+                changed = true;
+            }
+        }
+        changed
+    }
+}
+
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stderr>>> {
     terminal::enable_raw_mode().context("failed to enable raw mode")?;
     let mut stderr = io::stderr();
@@ -544,8 +610,16 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stderr>>) -> Result
 }
 
 fn app_loop(terminal: &mut Terminal<CrosstermBackend<Stderr>>, app: &mut App) -> Result<PathBuf> {
+    let mut directory_watcher = DirectoryWatcher::new(&app.cwd)?;
+
     loop {
         terminal.draw(|frame| draw(frame, app))?;
+
+        if directory_watcher.drain() {
+            if let Err(err) = app.refresh() {
+                app.message = Some(err.to_string());
+            }
+        }
 
         if !event::poll(Duration::from_millis(200))? {
             continue;
@@ -556,19 +630,25 @@ fn app_loop(terminal: &mut Terminal<CrosstermBackend<Stderr>>, app: &mut App) ->
         let visible_rows = visible_file_rows(layout.files);
 
         match event::read()? {
-            Event::Key(key) => {
+            TerminalEvent::Key(key) => {
                 match handle_key(app, key)? {
                     KeyAction::Continue => {}
                     KeyAction::Quit => return Ok(app.cwd.clone()),
                 }
                 run_pending_command(terminal, app);
+                if let Err(err) = directory_watcher.sync_path(&app.cwd) {
+                    app.message = Some(err.to_string());
+                }
                 app.ensure_selected_visible(visible_rows);
             }
-            Event::Mouse(mouse) => {
+            TerminalEvent::Mouse(mouse) => {
                 if handle_mouse(app, mouse, layout)? {
                     return Ok(app.cwd.clone());
                 }
                 run_pending_command(terminal, app);
+                if let Err(err) = directory_watcher.sync_path(&app.cwd) {
+                    app.message = Some(err.to_string());
+                }
             }
             _ => {}
         }
