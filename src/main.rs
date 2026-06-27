@@ -876,20 +876,31 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stderr>>) -> Result
 
 fn app_loop(terminal: &mut Terminal<CrosstermBackend<Stderr>>, app: &mut App) -> Result<PathBuf> {
     let mut directory_watcher = DirectoryWatcher::new(&app.cwd, git_root(app))?;
+    let mut pending_refresh_at = None;
+    let refresh_debounce = Duration::from_millis(150);
 
     loop {
         terminal.draw(|frame| draw(frame, app))?;
 
         if directory_watcher.drain() {
+            pending_refresh_at = Some(Instant::now() + refresh_debounce);
+        }
+
+        if pending_refresh_at.is_some_and(|at| Instant::now() >= at) {
             if let Err(err) = app.refresh() {
                 app.message = Some(err.to_string());
             }
             if let Err(err) = directory_watcher.sync_paths(&app.cwd, git_root(app)) {
                 app.message = Some(err.to_string());
             }
+            pending_refresh_at = None;
         }
 
-        if !event::poll(Duration::from_millis(200))? {
+        let poll_timeout = pending_refresh_at
+            .map(|at| at.saturating_duration_since(Instant::now()))
+            .unwrap_or_else(|| Duration::from_millis(200));
+
+        if !event::poll(poll_timeout)? {
             continue;
         }
 
