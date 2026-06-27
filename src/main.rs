@@ -782,11 +782,11 @@ impl DirectoryWatcher {
             NotifyConfig::default(),
         )
         .context("failed to create filesystem watcher")?;
+        let git_root = git_root.map(Path::to_path_buf);
         watcher
-            .watch(cwd, RecursiveMode::NonRecursive)
+            .watch(cwd, cwd_watch_mode(cwd, git_root.as_deref()))
             .with_context(|| format!("failed to watch {}", cwd.display()))?;
 
-        let git_root = git_root.map(Path::to_path_buf);
         if let Some(root) = git_root.as_ref().filter(|root| root.as_path() != cwd) {
             watcher
                 .watch(root, RecursiveMode::Recursive)
@@ -817,7 +817,7 @@ impl DirectoryWatcher {
         }
 
         self.watcher
-            .watch(cwd, RecursiveMode::NonRecursive)
+            .watch(cwd, cwd_watch_mode(cwd, next_git_root.as_deref()))
             .with_context(|| format!("failed to watch {}", cwd.display()))?;
         if let Some(root) = next_git_root.as_ref().filter(|root| root.as_path() != cwd) {
             self.watcher
@@ -839,6 +839,14 @@ impl DirectoryWatcher {
             }
         }
         changed
+    }
+}
+
+fn cwd_watch_mode(cwd: &Path, git_root: Option<&Path>) -> RecursiveMode {
+    if git_root.is_some_and(|root| root == cwd) {
+        RecursiveMode::Recursive
+    } else {
+        RecursiveMode::NonRecursive
     }
 }
 
