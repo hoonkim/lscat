@@ -276,6 +276,8 @@ struct App {
     show_hidden: bool,
     selected: usize,
     scroll: usize,
+    git_scroll: usize,
+    git_status: Option<GitStatus>,
     last_click: Option<(usize, Instant)>,
     search_active: bool,
     search: String,
@@ -303,6 +305,8 @@ impl App {
             show_hidden: false,
             selected: 0,
             scroll: 0,
+            git_scroll: 0,
+            git_status: None,
             last_click: None,
             search_active: false,
             search: String::new(),
@@ -318,6 +322,8 @@ impl App {
     fn refresh(&mut self) -> Result<()> {
         let selected_name = self.selected_entry().map(|entry| entry.name.clone());
         self.entries = read_entries(&self.cwd)?;
+        self.git_status = read_git_status(&self.cwd).ok().flatten();
+        self.git_scroll = cmp::min(self.git_scroll, self.git_status_lines().saturating_sub(1));
         let len = self.filtered_len();
         if len == 0 {
             self.selected = 0;
@@ -369,6 +375,25 @@ impl App {
         self.scroll = next as usize;
     }
 
+    fn scroll_git_by(&mut self, delta: isize, visible_rows: usize) {
+        let len = self.git_status_lines();
+        if len == 0 || visible_rows == 0 {
+            self.git_scroll = 0;
+            return;
+        }
+
+        let max_scroll = len.saturating_sub(visible_rows);
+        let next = (self.git_scroll as isize + delta).clamp(0, max_scroll as isize);
+        self.git_scroll = next as usize;
+    }
+
+    fn git_status_lines(&self) -> usize {
+        self.git_status
+            .as_ref()
+            .map(|status| status.display_lines().len())
+            .unwrap_or(0)
+    }
+
     fn ensure_selected_visible(&mut self, visible_rows: usize) {
         if visible_rows == 0 || self.filtered_len() == 0 {
             self.scroll = 0;
@@ -418,6 +443,7 @@ impl App {
         self.search = search;
         self.selected = 0;
         self.scroll = 0;
+        self.git_scroll = 0;
         self.last_click = None;
     }
 
@@ -510,6 +536,194 @@ struct Entry {
     is_dir: bool,
     len: Option<u64>,
     hidden: bool,
+}
+
+#[derive(Debug, Clone)]
+struct GitStatus {
+    root: PathBuf,
+    branch: String,
+    changes: Vec<GitChange>,
+}
+
+#[derive(Debug, Clone)]
+struct GitChange {
+    path: String,
+    staged: bool,
+    modified: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitFileState {
+    Clean,
+    Modified,
+    Staged,
+    Both,
+}
+
+impl GitStatus {
+    fn file_state(&self, entry: &Entry) -> GitFileState {
+        let Ok(entry_path) = entry.path.strip_prefix(&self.root) else {
+            return GitFileState::Clean;
+        };
+        let entry_path = normalize_git_path(entry_path);
+
+        let mut staged = false;
+        let mut modified = false;
+        for change in &self.changes {
+            if git_path_matches_entry(&change.path, &entry_path, entry.is_dir) {
+                staged |= change.staged;
+                modified |= change.modified;
+            }
+        }
+
+        match (staged, modified) {
+            (true, true) => GitFileState::Both,
+            (true, false) => GitFileState::Staged,
+            (false, true) => GitFileState::Modified,
+            (false, false) => GitFileState::Clean,
+        }
+    }
+
+    fn display_lines(&self) -> Vec<GitStatusLine> {
+        let mut lines = Vec::new();
+        let staged = self.changes.iter().filter(|change| change.staged).count();
+        let modified = self.changes.iter().filter(|change| change.modified).count();
+
+        lines.push(GitStatusLine {
+            label: format!("branch {}", self.branch),
+            style: Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        });
+        lines.push(GitStatusLine {
+            label: format!("staged {staged}  modified {modified}"),
+            style: Style::default().fg(Color::Gray),
+        });
+
+        if staged > 0 {
+            lines.push(GitStatusLine {
+                label: "staged".to_string(),
+                style: Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            });
+            for change in self.changes.iter().filter(|change| change.staged) {
+                lines.push(GitStatusLine {
+                    label: format!("S {}", change.path),
+                    style: Style::default().fg(Color::Green),
+                });
+            }
+        }
+
+        if modified > 0 {
+            lines.push(GitStatusLine {
+                label: "modified".to_string(),
+                style: Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            });
+            for change in self.changes.iter().filter(|change| change.modified) {
+                lines.push(GitStatusLine {
+                    label: format!("M {}", change.path),
+                    style: Style::default().fg(Color::Red),
+                });
+            }
+        }
+
+        if self.changes.is_empty() {
+            lines.push(GitStatusLine {
+                label: "clean".to_string(),
+                style: Style::default().fg(Color::Green),
+            });
+        }
+
+        lines
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GitStatusLine {
+    label: String,
+    style: Style,
+}
+
+fn read_git_status(cwd: &Path) -> Result<Option<GitStatus>> {
+    let root_output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .arg("rev-parse")
+        .arg("--show-toplevel")
+        .output()
+        .context("failed to run git rev-parse")?;
+    if !root_output.status.success() {
+        return Ok(None);
+    }
+
+    let root = String::from_utf8_lossy(&root_output.stdout)
+        .trim()
+        .to_string();
+    if root.is_empty() {
+        return Ok(None);
+    }
+    let root = PathBuf::from(root);
+
+    let status_output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .arg("status")
+        .arg("--porcelain=v1")
+        .arg("-b")
+        .output()
+        .context("failed to run git status")?;
+    if !status_output.status.success() {
+        return Ok(None);
+    }
+
+    let mut branch = "unknown".to_string();
+    let mut changes = Vec::new();
+    for line in String::from_utf8_lossy(&status_output.stdout).lines() {
+        if let Some(raw_branch) = line.strip_prefix("## ") {
+            branch = raw_branch
+                .split("...")
+                .next()
+                .unwrap_or(raw_branch)
+                .to_string();
+            continue;
+        }
+
+        if line.len() < 4 {
+            continue;
+        }
+
+        let mut chars = line.chars();
+        let x = chars.next().unwrap_or(' ');
+        let y = chars.next().unwrap_or(' ');
+        let path = line[3..].split(" -> ").last().unwrap_or("").to_string();
+        if path.is_empty() {
+            continue;
+        }
+
+        changes.push(GitChange {
+            path,
+            staged: x != ' ' && x != '?',
+            modified: y != ' ' || x == '?',
+        });
+    }
+
+    Ok(Some(GitStatus {
+        root,
+        branch,
+        changes,
+    }))
+}
+
+fn normalize_git_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn git_path_matches_entry(change_path: &str, entry_path: &str, is_dir: bool) -> bool {
+    change_path == entry_path || (is_dir && change_path.starts_with(&format!("{entry_path}/")))
 }
 
 fn read_entries(dir: &Path) -> Result<Vec<Entry>> {
@@ -650,7 +864,10 @@ fn app_loop(terminal: &mut Terminal<CrosstermBackend<Stderr>>, app: &mut App) ->
         }
 
         let size = terminal.size()?;
-        let layout = UiLayout::from(Rect::new(0, 0, size.width, size.height));
+        let layout = UiLayout::from(
+            Rect::new(0, 0, size.width, size.height),
+            app.git_status.is_some(),
+        );
         let visible_rows = visible_file_rows(layout.files);
 
         match event::read()? {
@@ -907,6 +1124,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent, layout: UiLayout) -> Result<bool> {
     let visible_rows = visible_file_rows(layout.files);
+    let git_rows = layout.git.map(visible_git_rows).unwrap_or(0);
 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
@@ -933,8 +1151,26 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, layout: UiLayout) -> Result<bo
                 app.parent();
             }
         }
-        MouseEventKind::ScrollDown => app.scroll_by(3, visible_rows),
-        MouseEventKind::ScrollUp => app.scroll_by(-3, visible_rows),
+        MouseEventKind::ScrollDown => {
+            if layout
+                .git
+                .is_some_and(|area| in_rect(area, mouse.column, mouse.row))
+            {
+                app.scroll_git_by(3, git_rows);
+            } else {
+                app.scroll_by(3, visible_rows);
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            if layout
+                .git
+                .is_some_and(|area| in_rect(area, mouse.column, mouse.row))
+            {
+                app.scroll_git_by(-3, git_rows);
+            } else {
+                app.scroll_by(-3, visible_rows);
+            }
+        }
         _ => {}
     }
 
@@ -942,11 +1178,14 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, layout: UiLayout) -> Result<bo
 }
 
 fn draw(frame: &mut Frame<'_>, app: &App) {
-    let layout = UiLayout::from(frame.area());
+    let layout = UiLayout::from(frame.area(), app.git_status.is_some());
 
     draw_header(frame, layout.header, app);
     draw_entries(frame, layout.files, app);
     draw_preview(frame, layout.preview, app);
+    if let Some(area) = layout.git {
+        draw_git_status(frame, area, app);
+    }
     draw_footer(frame, layout.footer, app);
 }
 
@@ -955,11 +1194,12 @@ struct UiLayout {
     header: Rect,
     files: Rect,
     preview: Rect,
+    git: Option<Rect>,
     footer: Rect,
 }
 
 impl UiLayout {
-    fn from(area: Rect) -> Self {
+    fn from(area: Rect, show_git: bool) -> Self {
         let vertical = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -974,10 +1214,21 @@ impl UiLayout {
             .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
             .split(vertical[1]);
 
+        let (preview, git) = if show_git {
+            let right = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+                .split(body[1]);
+            (right[0], Some(right[1]))
+        } else {
+            (body[1], None)
+        };
+
         Self {
             header: vertical[0],
             files: body[0],
-            preview: body[1],
+            preview,
+            git,
             footer: vertical[2],
         }
     }
@@ -1064,7 +1315,22 @@ fn draw_entries(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .take(visible_rows)
         .map(|entry| {
             let icon = if entry.is_dir { "DIR" } else { "FILE" };
-            let name_style = if entry.is_dir {
+            let git_state = app
+                .git_status
+                .as_ref()
+                .map(|status| status.file_state(entry))
+                .unwrap_or(GitFileState::Clean);
+            let name_style = if git_state == GitFileState::Both {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else if git_state == GitFileState::Staged {
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            } else if git_state == GitFileState::Modified {
+                Style::default().fg(Color::Red)
+            } else if entry.is_dir {
                 Style::default()
                     .fg(Color::Blue)
                     .add_modifier(Modifier::BOLD)
@@ -1104,7 +1370,30 @@ fn draw_entries(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_stateful_widget(table, area, &mut state);
 }
 
+fn draw_git_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let Some(git_status) = app.git_status.as_ref() else {
+        return;
+    };
+
+    let lines = git_status.display_lines();
+    let visible_rows = visible_git_rows(area);
+    let items = lines
+        .iter()
+        .skip(app.git_scroll)
+        .take(visible_rows)
+        .map(|line| ListItem::new(line.label.clone()).style(line.style))
+        .collect::<Vec<_>>();
+    let title = format!(" git {} ", git_status.branch);
+    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
+
+    frame.render_widget(list, area);
+}
+
 fn visible_file_rows(area: Rect) -> usize {
+    area.height.saturating_sub(2) as usize
+}
+
+fn visible_git_rows(area: Rect) -> usize {
     area.height.saturating_sub(2) as usize
 }
 

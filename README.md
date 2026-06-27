@@ -9,6 +9,10 @@ to the directory currently shown in the UI.
 The visible directory refreshes automatically when files are created, removed,
 renamed, or modified.
 
+Inside a Git worktree, staged files are shown in green and modified or
+untracked files are shown in red. The right pane also shows branch and status
+details, with mouse-wheel scrolling when the list is long.
+
 ## Install
 
 ```sh
