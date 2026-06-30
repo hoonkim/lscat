@@ -30,6 +30,12 @@ use ratatui::{
     },
 };
 use serde::Deserialize;
+use syntect::{
+    highlighting::{
+        HighlightIterator, HighlightState, Highlighter as SynHighlighter, Theme, ThemeSet,
+    },
+    parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet},
+};
 
 fn main() -> Result<()> {
     let config = CliConfig::from_args()?;
@@ -120,6 +126,7 @@ fn print_help() {
          Keys:\n\
            Up/Down, k/j   Move selection\n\
            u              Toggle hidden files\n\
+           d              Toggle git diff mode ([/] change, </> file)\n\
            /              Search in current directory\n\
            !COMMAND       Run command here, then return to lscat\n\
            Enter, l       Open selected directory\n\
@@ -285,6 +292,18 @@ struct App {
     command_input: String,
     pending_command: Option<PendingCommand>,
     message: Option<String>,
+    diff_mode: bool,
+    diff_selected: usize,
+    diff_scroll: usize,
+    diff_view_rows: usize,
+    diff_focus: usize,
+    diff_raw_lines: Vec<RawDiffLine>,
+    diff_lines: Vec<DiffLine>,
+    diff_highlighted: usize,
+    diff_hl: Option<DiffHlState>,
+    diff_key: String,
+    diff_raw: String,
+    highlighter: Option<Highlighter>,
 }
 
 #[derive(Debug, Clone)]
@@ -314,6 +333,18 @@ impl App {
             command_input: String::new(),
             pending_command: None,
             message: None,
+            diff_mode: false,
+            diff_selected: 0,
+            diff_scroll: 0,
+            diff_view_rows: 0,
+            diff_focus: 0,
+            diff_raw_lines: Vec::new(),
+            diff_lines: Vec::new(),
+            diff_highlighted: 0,
+            diff_hl: None,
+            diff_key: String::new(),
+            diff_raw: String::new(),
+            highlighter: None,
         };
         app.refresh()?;
         Ok(app)
@@ -341,6 +372,17 @@ impl App {
                 }
             }
         }
+
+        if self.diff_mode {
+            let count = self.diff_target_count();
+            if count == 0 {
+                self.exit_diff_mode();
+            } else {
+                self.diff_selected = cmp::min(self.diff_selected, count - 1);
+                self.reload_diff();
+            }
+        }
+
         Ok(())
     }
 
@@ -513,6 +555,253 @@ impl App {
         }
     }
 
+    fn toggle_diff_mode(&mut self) {
+        if self.diff_mode {
+            self.exit_diff_mode();
+            return;
+        }
+
+        let initial = {
+            let Some(status) = self.git_status.as_ref() else {
+                self.message = Some("not a git repository".to_string());
+                return;
+            };
+            let targets = status.diff_targets();
+            if targets.is_empty() {
+                self.message = Some("no changes to diff".to_string());
+                return;
+            }
+
+            self.selected_entry()
+                .and_then(|entry| entry.path.strip_prefix(&status.root).ok())
+                .map(normalize_git_path)
+                .and_then(|rel| targets.iter().position(|target| target.path == rel))
+                .unwrap_or(0)
+        };
+
+        if self.highlighter.is_none() {
+            self.highlighter = Some(Highlighter::new());
+        }
+
+        self.diff_mode = true;
+        self.diff_selected = initial;
+        self.message = None;
+        self.load_diff();
+    }
+
+    fn exit_diff_mode(&mut self) {
+        self.diff_mode = false;
+        self.diff_scroll = 0;
+        self.clear_diff();
+        self.message = None;
+    }
+
+    fn clear_diff(&mut self) {
+        self.diff_raw_lines = Vec::new();
+        self.diff_lines = Vec::new();
+        self.diff_highlighted = 0;
+        self.diff_focus = 0;
+        self.diff_hl = None;
+        self.diff_key.clear();
+        self.diff_raw.clear();
+    }
+
+    fn diff_target_count(&self) -> usize {
+        self.git_status
+            .as_ref()
+            .map(|status| status.diff_targets().len())
+            .unwrap_or(0)
+    }
+
+    fn load_diff(&mut self) {
+        self.diff_scroll = 0;
+        self.reload_diff();
+    }
+
+    fn reload_diff(&mut self) {
+        let target = self.git_status.as_ref().and_then(|status| {
+            status
+                .diff_targets()
+                .into_iter()
+                .nth(self.diff_selected)
+                .map(|target| (status.root.clone(), target))
+        });
+
+        let Some((root, target)) = target else {
+            self.clear_diff();
+            return;
+        };
+
+        let key = format!("{}\u{0}{}", target.staged, target.path);
+        match run_git_diff(&root, &target) {
+            Ok(raw) => {
+                // Skip re-parsing/re-highlighting when the diff is unchanged so
+                // that already-highlighted lines (and progress) are preserved.
+                if key == self.diff_key && raw == self.diff_raw && !self.diff_raw_lines.is_empty()
+                {
+                    self.diff_scroll = cmp::min(self.diff_scroll, self.max_diff_scroll());
+                    return;
+                }
+
+                if raw.trim().is_empty() {
+                    self.set_diff_body(vec![RawDiffLine::message("(no diff)")], None);
+                } else {
+                    self.set_diff_body(parse_diff_body(&raw), Some(target.path.clone()));
+                }
+                self.diff_key = key;
+                self.diff_raw = raw;
+            }
+            Err(message) => {
+                self.set_diff_body(vec![RawDiffLine::message(message)], None);
+                self.diff_key = key;
+                self.diff_raw = String::new();
+            }
+        }
+
+        self.diff_scroll = cmp::min(self.diff_scroll, self.max_diff_scroll());
+    }
+
+    /// Install a freshly parsed diff body and reset the incremental highlight
+    /// state. Highlighting itself is deferred to `ensure_diff_highlighted`.
+    fn set_diff_body(&mut self, body: Vec<RawDiffLine>, syntax_path: Option<String>) {
+        self.diff_raw_lines = body;
+        self.diff_lines = Vec::new();
+        self.diff_highlighted = 0;
+        self.diff_focus = 0;
+        self.diff_hl = self.highlighter.as_ref().map(|highlighter| {
+            let syntax = match syntax_path.as_deref() {
+                Some(path) => highlighter.syntax_for(path),
+                None => highlighter.syntax_set.find_syntax_plain_text(),
+            };
+            let syn_highlighter = SynHighlighter::new(&highlighter.theme);
+            DiffHlState {
+                parse_old: ParseState::new(syntax),
+                parse_new: ParseState::new(syntax),
+                hl_old: HighlightState::new(&syn_highlighter, ScopeStack::new()),
+                hl_new: HighlightState::new(&syn_highlighter, ScopeStack::new()),
+            }
+        });
+    }
+
+    /// Highlight diff lines up to (and including) `index`, picking up where the
+    /// last call left off. Cheap when already highlighted past `index`.
+    fn ensure_diff_highlighted(&mut self, index: usize) {
+        let Some(highlighter) = self.highlighter.as_ref() else {
+            return;
+        };
+        let Some(state) = self.diff_hl.as_mut() else {
+            return;
+        };
+        let target = cmp::min(index + 1, self.diff_raw_lines.len());
+        if self.diff_highlighted >= target {
+            return;
+        }
+
+        let syn_highlighter = SynHighlighter::new(&highlighter.theme);
+        while self.diff_highlighted < target {
+            let raw = &self.diff_raw_lines[self.diff_highlighted];
+            let line = build_diff_line(raw, &highlighter.syntax_set, &syn_highlighter, state);
+            self.diff_lines.push(line);
+            self.diff_highlighted += 1;
+        }
+    }
+
+    fn diff_line_count(&self) -> usize {
+        cmp::max(self.diff_raw_lines.len(), self.diff_lines.len())
+    }
+
+    fn max_diff_scroll(&self) -> usize {
+        self.diff_line_count()
+            .saturating_sub(self.diff_view_rows.max(1))
+    }
+
+    fn scroll_diff_by(&mut self, delta: isize) {
+        if self.diff_line_count() == 0 {
+            self.diff_scroll = 0;
+            self.diff_focus = 0;
+            return;
+        }
+        let max = self.max_diff_scroll() as isize;
+        let next = (self.diff_scroll as isize + delta).clamp(0, max);
+        self.diff_scroll = next as usize;
+        // Manual scrolling moves the change-jump reference to the top of the view.
+        self.diff_focus = self.diff_scroll;
+    }
+
+    fn set_diff_scroll(&mut self, scroll: usize) {
+        self.diff_scroll = cmp::min(scroll, self.max_diff_scroll());
+        self.diff_focus = self.diff_scroll;
+    }
+
+    fn diff_change_indices(&self) -> Vec<usize> {
+        change_block_starts(&self.diff_raw_lines)
+    }
+
+    /// Jump so the change at `index` sits a few lines below the top, rather than
+    /// flush against it, for readable leading context.
+    fn focus_change(&mut self, index: usize) {
+        self.diff_focus = index;
+        self.diff_scroll = cmp::min(
+            index.saturating_sub(CHANGE_JUMP_MARGIN),
+            self.max_diff_scroll(),
+        );
+    }
+
+    fn next_change(&mut self) {
+        if let Some(next) = self
+            .diff_change_indices()
+            .into_iter()
+            .find(|index| *index > self.diff_focus)
+        {
+            self.focus_change(next);
+        }
+    }
+
+    fn prev_change(&mut self) {
+        if let Some(prev) = self
+            .diff_change_indices()
+            .into_iter()
+            .rev()
+            .find(|index| *index < self.diff_focus)
+        {
+            self.focus_change(prev);
+        }
+    }
+
+    fn next_diff_file(&mut self) {
+        let count = self.diff_target_count();
+        if count > 0 && self.diff_selected + 1 < count {
+            self.diff_selected += 1;
+            self.load_diff();
+        }
+    }
+
+    fn prev_diff_file(&mut self) {
+        if self.diff_selected > 0 {
+            self.diff_selected -= 1;
+            self.load_diff();
+        }
+    }
+
+    fn diff_list_offset(&self, visible: usize) -> usize {
+        if visible > 0 && self.diff_selected >= visible {
+            self.diff_selected + 1 - visible
+        } else {
+            0
+        }
+    }
+
+    fn current_diff_title(&self) -> String {
+        self.git_status
+            .as_ref()
+            .and_then(|status| status.diff_targets().into_iter().nth(self.diff_selected))
+            .map(|target| {
+                let marker = if target.staged { "S" } else { "M" };
+                format!(" diff {marker} {} ", target.path)
+            })
+            .unwrap_or_else(|| " diff ".to_string())
+    }
+
     fn jump_to_git_path(&mut self, git_path: &str, visible_rows: usize) {
         let Some(root) = self.git_status.as_ref().map(|status| status.root.clone()) else {
             return;
@@ -579,12 +868,14 @@ impl App {
         self.command_input.clear();
         self.pending_command = None;
         self.message = None;
+        self.diff_mode = false;
+        self.diff_selected = 0;
+        self.diff_scroll = 0;
+        self.clear_diff();
         self.refresh()?;
 
         if let Some(old_name) = old_name {
-            if let Some(index) = self.entries.iter().position(|entry| entry.name == old_name) {
-                self.selected = index;
-            }
+            self.select_entry_named(&old_name);
         }
 
         Ok(())
@@ -644,6 +935,23 @@ impl GitStatus {
             (false, true) => GitFileState::Modified,
             (false, false) => GitFileState::Clean,
         }
+    }
+
+    fn diff_targets(&self) -> Vec<DiffTarget> {
+        let mut targets = Vec::new();
+        for change in self.changes.iter().filter(|change| change.staged) {
+            targets.push(DiffTarget {
+                path: change.path.clone(),
+                staged: true,
+            });
+        }
+        for change in self.changes.iter().filter(|change| change.modified) {
+            targets.push(DiffTarget {
+                path: change.path.clone(),
+                staged: false,
+            });
+        }
+        targets
     }
 
     fn display_lines(&self) -> Vec<GitStatusLine> {
@@ -713,6 +1021,290 @@ struct GitStatusLine {
     label: String,
     style: Style,
     path: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DiffTarget {
+    path: String,
+    staged: bool,
+}
+
+/// Background tints approximating a translucent overlay on a dark terminal.
+const ADD_BG: Color = Color::Rgb(22, 51, 29);
+const DEL_BG: Color = Color::Rgb(58, 27, 31);
+
+/// Lines of leading context kept above a change when jumping with `[`/`]`.
+const CHANGE_JUMP_MARGIN: usize = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffKind {
+    Context,
+    Add,
+    Del,
+}
+
+/// One parsed diff body line, before syntax highlighting (cheap to build).
+#[derive(Debug, Clone)]
+struct RawDiffLine {
+    code: String,
+    kind: DiffKind,
+}
+
+impl RawDiffLine {
+    fn message(text: impl Into<String>) -> Self {
+        Self {
+            code: text.into(),
+            kind: DiffKind::Context,
+        }
+    }
+
+    fn is_change(&self) -> bool {
+        matches!(self.kind, DiffKind::Add | DiffKind::Del)
+    }
+}
+
+/// One rendered diff line: highlighted spans plus its background tint.
+#[derive(Debug, Clone)]
+struct DiffLine {
+    spans: Vec<Span<'static>>,
+    bg: Option<Color>,
+}
+
+/// Incremental syntect state for the two sides of a diff (owned, no borrows, so
+/// it can live in `App` and be advanced one line at a time).
+struct DiffHlState {
+    parse_old: ParseState,
+    parse_new: ParseState,
+    hl_old: HighlightState,
+    hl_new: HighlightState,
+}
+
+impl std::fmt::Debug for DiffHlState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DiffHlState")
+    }
+}
+
+struct Highlighter {
+    syntax_set: SyntaxSet,
+    theme: Theme,
+}
+
+impl std::fmt::Debug for Highlighter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Highlighter")
+    }
+}
+
+impl Highlighter {
+    fn new() -> Self {
+        let syntax_set = SyntaxSet::load_defaults_newlines();
+        let theme_set = ThemeSet::load_defaults();
+        let theme = theme_set
+            .themes
+            .get("base16-ocean.dark")
+            .cloned()
+            .unwrap_or_default();
+        Self { syntax_set, theme }
+    }
+
+    fn syntax_for(&self, path: &str) -> &SyntaxReference {
+        let extension = Path::new(path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("");
+        self.syntax_set
+            .find_syntax_by_extension(extension)
+            .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text())
+    }
+}
+
+/// Start indices of each maximal run of added/removed lines (the "change points").
+fn change_block_starts(lines: &[RawDiffLine]) -> Vec<usize> {
+    let mut indices = Vec::new();
+    let mut prev_change = false;
+    for (index, line) in lines.iter().enumerate() {
+        if line.is_change() && !prev_change {
+            indices.push(index);
+        }
+        prev_change = line.is_change();
+    }
+    indices
+}
+
+fn syntect_color(color: syntect::highlighting::Color) -> Color {
+    Color::Rgb(color.r, color.g, color.b)
+}
+
+/// Context lines requested from `git diff` so the entire file is shown, not just
+/// the changed hunks. Capped well above any realistic source file length.
+const FULL_FILE_CONTEXT: u32 = 1_000_000;
+
+fn run_git_diff(root: &Path, target: &DiffTarget) -> Result<String, String> {
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(root)
+        .arg("diff")
+        .arg(format!("--unified={FULL_FILE_CONTEXT}"));
+    if target.staged {
+        command.arg("--cached");
+    }
+    command.arg("--").arg(&target.path);
+
+    let output = command
+        .output()
+        .map_err(|err| format!("failed to run git diff: {err}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let message = stderr.trim();
+        return Err(if message.is_empty() {
+            "git diff failed".to_string()
+        } else {
+            message.to_string()
+        });
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Parse a unified diff into body lines, dropping the file/hunk headers so only
+/// the code remains. Header lines never carry a +/-/space prefix, so they can't
+/// be confused with file content.
+fn parse_diff_body(raw: &str) -> Vec<RawDiffLine> {
+    let mut lines = Vec::new();
+    let mut in_body = false;
+    for raw_line in raw.lines() {
+        if !in_body {
+            // The first `@@` marks the start of the body.
+            if raw_line.starts_with("@@") {
+                in_body = true;
+            }
+            continue;
+        }
+
+        // With full context there is a single hunk, but guard against extra
+        // hunk headers and the "\ No newline at end of file" marker.
+        if raw_line.starts_with("@@") || raw_line.starts_with('\\') {
+            continue;
+        }
+
+        let kind = match raw_line.chars().next() {
+            Some('+') => DiffKind::Add,
+            Some('-') => DiffKind::Del,
+            _ => DiffKind::Context,
+        };
+        let code = raw_line.get(1..).unwrap_or("").replace('\t', "    ");
+        lines.push(RawDiffLine { code, kind });
+    }
+
+    lines
+}
+
+/// Highlight one code line, advancing `parse`/`hl` so multi-line constructs keep
+/// their context across calls. Returns the styled spans.
+fn highlight_one(
+    parse: &mut ParseState,
+    hl: &mut HighlightState,
+    syntax_set: &SyntaxSet,
+    syn_highlighter: &SynHighlighter,
+    code: &str,
+) -> Vec<Span<'static>> {
+    let line = format!("{code}\n");
+    let ops = parse.parse_line(&line, syntax_set).unwrap_or_default();
+    HighlightIterator::new(hl, &ops, &line, syn_highlighter)
+        .filter_map(|(style, text)| {
+            let text = text.strip_suffix('\n').unwrap_or(text);
+            if text.is_empty() {
+                return None;
+            }
+            Some(Span::styled(
+                text.to_string(),
+                Style::default().fg(syntect_color(style.foreground)),
+            ))
+        })
+        .collect()
+}
+
+/// Advance the parse/highlight state for one line without producing spans (used
+/// to keep the "old" side in sync over context lines).
+fn advance_one(
+    parse: &mut ParseState,
+    hl: &mut HighlightState,
+    syntax_set: &SyntaxSet,
+    syn_highlighter: &SynHighlighter,
+    code: &str,
+) {
+    let line = format!("{code}\n");
+    let ops = parse.parse_line(&line, syntax_set).unwrap_or_default();
+    HighlightIterator::new(hl, &ops, &line, syn_highlighter).for_each(|_| {});
+}
+
+/// Build the rendered line for one raw diff line, applying the add/remove
+/// background tint and a marker gutter.
+fn build_diff_line(
+    raw: &RawDiffLine,
+    syntax_set: &SyntaxSet,
+    syn_highlighter: &SynHighlighter,
+    state: &mut DiffHlState,
+) -> DiffLine {
+    let (bg, marker_color, marker_char) = match raw.kind {
+        DiffKind::Add => (Some(ADD_BG), Color::Green, '+'),
+        DiffKind::Del => (Some(DEL_BG), Color::Red, '-'),
+        DiffKind::Context => (None, Color::DarkGray, ' '),
+    };
+
+    let highlighted = match raw.kind {
+        DiffKind::Add => highlight_one(
+            &mut state.parse_new,
+            &mut state.hl_new,
+            syntax_set,
+            syn_highlighter,
+            &raw.code,
+        ),
+        DiffKind::Del => highlight_one(
+            &mut state.parse_old,
+            &mut state.hl_old,
+            syntax_set,
+            syn_highlighter,
+            &raw.code,
+        ),
+        DiffKind::Context => {
+            let spans = highlight_one(
+                &mut state.parse_new,
+                &mut state.hl_new,
+                syntax_set,
+                syn_highlighter,
+                &raw.code,
+            );
+            advance_one(
+                &mut state.parse_old,
+                &mut state.hl_old,
+                syntax_set,
+                syn_highlighter,
+                &raw.code,
+            );
+            spans
+        }
+    };
+
+    let marker_style = match bg {
+        Some(bg) => Style::default().fg(marker_color).bg(bg),
+        None => Style::default().fg(marker_color),
+    };
+
+    let mut spans = Vec::with_capacity(highlighted.len() + 1);
+    spans.push(Span::styled(format!("{marker_char} "), marker_style));
+    for span in highlighted {
+        let style = match bg {
+            Some(bg) => span.style.bg(bg),
+            None => span.style,
+        };
+        spans.push(Span::styled(span.content, style));
+    }
+
+    DiffLine { spans, bg }
 }
 
 fn read_git_status(cwd: &Path) -> Result<Option<GitStatus>> {
@@ -958,6 +1550,20 @@ fn app_loop(terminal: &mut Terminal<CrosstermBackend<Stderr>>, app: &mut App) ->
     let refresh_debounce = Duration::from_millis(150);
 
     loop {
+        // Highlight just the lines about to be drawn (lazy: keeps opening large
+        // files instant regardless of total length).
+        if app.diff_mode {
+            let size = terminal.size()?;
+            let layout = UiLayout::from(
+                Rect::new(0, 0, size.width, size.height),
+                app.git_status.is_some(),
+                true,
+            );
+            let visible_rows = visible_file_rows(layout.files);
+            app.diff_view_rows = visible_rows;
+            app.ensure_diff_highlighted(app.diff_scroll + visible_rows);
+        }
+
         terminal.draw(|frame| draw(frame, app))?;
 
         if directory_watcher.drain() {
@@ -986,8 +1592,10 @@ fn app_loop(terminal: &mut Terminal<CrosstermBackend<Stderr>>, app: &mut App) ->
         let layout = UiLayout::from(
             Rect::new(0, 0, size.width, size.height),
             app.git_status.is_some(),
+            app.diff_mode,
         );
         let visible_rows = visible_file_rows(layout.files);
+        app.diff_view_rows = visible_rows;
 
         match event::read()? {
             TerminalEvent::Key(key) => {
@@ -1148,6 +1756,28 @@ enum KeyAction {
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
+    if app.diff_mode {
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(KeyAction::Quit),
+            (KeyCode::Esc, _) | (KeyCode::Char('q'), _) | (KeyCode::Char('d'), _) => {
+                app.exit_diff_mode()
+            }
+            (KeyCode::Char('j'), _) | (KeyCode::Down, _) => app.scroll_diff_by(1),
+            (KeyCode::Char('k'), _) | (KeyCode::Up, _) => app.scroll_diff_by(-1),
+            (KeyCode::PageDown, _) => app.scroll_diff_by(app.diff_view_rows as isize),
+            (KeyCode::PageUp, _) => app.scroll_diff_by(-(app.diff_view_rows as isize)),
+            (KeyCode::Char(']'), _) => app.next_change(),
+            (KeyCode::Char('['), _) => app.prev_change(),
+            (KeyCode::Char('>'), _) => app.next_diff_file(),
+            (KeyCode::Char('<'), _) => app.prev_diff_file(),
+            (KeyCode::Char('g'), _) => app.set_diff_scroll(0),
+            (KeyCode::Char('G'), _) => app.set_diff_scroll(app.diff_line_count()),
+            _ => {}
+        }
+
+        return Ok(KeyAction::Continue);
+    }
+
     if app.command_active {
         match key.code {
             KeyCode::Esc => {
@@ -1229,6 +1859,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
         (KeyCode::Char('g'), _) => app.first(),
         (KeyCode::Char('G'), _) => app.last(),
         (KeyCode::Char('u'), _) => app.toggle_hidden(),
+        (KeyCode::Char('d'), _) => app.toggle_diff_mode(),
         (KeyCode::Enter, _) | (KeyCode::Right, _) | (KeyCode::Char('l'), _) => app.open_selected(),
         (KeyCode::Backspace, _) | (KeyCode::Left, _) | (KeyCode::Char('h'), _) => app.parent(),
         (KeyCode::Char('r'), _) => {
@@ -1244,6 +1875,28 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
 fn handle_mouse(app: &mut App, mouse: MouseEvent, layout: UiLayout) -> Result<bool> {
     let visible_rows = visible_file_rows(layout.files);
     let git_rows = layout.git.map(visible_git_rows).unwrap_or(0);
+
+    if app.diff_mode {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(area) = layout.git {
+                    let offset = app.diff_list_offset(visible_git_rows(area));
+                    if let Some(index) = row_at(area, offset, mouse.column, mouse.row)
+                        && index < app.diff_target_count()
+                    {
+                        app.diff_selected = index;
+                        app.load_diff();
+                    }
+                }
+            }
+            MouseEventKind::Down(MouseButton::Right) => app.exit_diff_mode(),
+            MouseEventKind::ScrollDown => app.scroll_diff_by(1),
+            MouseEventKind::ScrollUp => app.scroll_diff_by(-1),
+            _ => {}
+        }
+
+        return Ok(false);
+    }
 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
@@ -1306,13 +1959,20 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, layout: UiLayout) -> Result<bo
 }
 
 fn draw(frame: &mut Frame<'_>, app: &App) {
-    let layout = UiLayout::from(frame.area(), app.git_status.is_some());
+    let layout = UiLayout::from(frame.area(), app.git_status.is_some(), app.diff_mode);
 
     draw_header(frame, layout.header, app);
-    draw_entries(frame, layout.files, app);
-    draw_preview(frame, layout.preview, app);
-    if let Some(area) = layout.git {
-        draw_git_status(frame, area, app);
+    if app.diff_mode {
+        draw_diff(frame, layout.files, app);
+        if let Some(area) = layout.git {
+            draw_diff_file_list(frame, area, app);
+        }
+    } else {
+        draw_entries(frame, layout.files, app);
+        draw_preview(frame, layout.preview, app);
+        if let Some(area) = layout.git {
+            draw_git_status(frame, area, app);
+        }
     }
     draw_footer(frame, layout.footer, app);
 }
@@ -1327,7 +1987,7 @@ struct UiLayout {
 }
 
 impl UiLayout {
-    fn from(area: Rect, show_git: bool) -> Self {
+    fn from(area: Rect, show_git: bool, diff_mode: bool) -> Self {
         let vertical = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -1342,7 +2002,9 @@ impl UiLayout {
             .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
             .split(vertical[1]);
 
-        let (preview, git) = if show_git {
+        let (preview, git) = if show_git && diff_mode {
+            (body[1], Some(body[1]))
+        } else if show_git {
             let right = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
@@ -1517,6 +2179,78 @@ fn draw_git_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(list, area);
 }
 
+fn draw_diff(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let visible_rows = visible_file_rows(area);
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let total = app.diff_line_count();
+    let skip = cmp::min(app.diff_scroll, total.saturating_sub(visible_rows.max(1)));
+    let lines = app
+        .diff_lines
+        .iter()
+        .skip(skip)
+        .take(visible_rows)
+        .map(|line| {
+            let mut spans = line.spans.clone();
+            if let Some(bg) = line.bg {
+                let used: usize = spans.iter().map(|span| span.content.chars().count()).sum();
+                if used < inner_width {
+                    spans.push(Span::styled(
+                        " ".repeat(inner_width - used),
+                        Style::default().bg(bg),
+                    ));
+                }
+            }
+            Line::from(spans)
+        })
+        .collect::<Vec<_>>();
+
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(app.current_diff_title()),
+    );
+    frame.render_widget(paragraph, area);
+}
+
+fn draw_diff_file_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let Some(git_status) = app.git_status.as_ref() else {
+        return;
+    };
+
+    let targets = git_status.diff_targets();
+    let visible_rows = visible_git_rows(area);
+    let offset = app.diff_list_offset(visible_rows);
+    let items = targets
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(visible_rows)
+        .map(|(index, target)| {
+            let marker = if target.staged { "S" } else { "M" };
+            let color = if target.staged {
+                Color::Green
+            } else {
+                Color::Red
+            };
+            let selected = index == app.diff_selected;
+            let prefix = if selected { "> " } else { "  " };
+            let style = if selected {
+                Style::default()
+                    .fg(color)
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(color)
+            };
+            ListItem::new(format!("{prefix}{marker} {}", target.path)).style(style)
+        })
+        .collect::<Vec<_>>();
+
+    let title = format!(" git {} ", git_status.branch);
+    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
+    frame.render_widget(list, area);
+}
+
 fn visible_file_rows(area: Rect) -> usize {
     area.height.saturating_sub(2) as usize
 }
@@ -1614,7 +2348,9 @@ fn draw_preview(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let text = if app.command_active {
+    let text = if app.diff_mode {
+        "j/k scroll  [ ] change  < > file  d/Esc/q exit".to_string()
+    } else if app.command_active {
         format!("!{}", app.command_input)
     } else if app.search_active {
         format!("/{}", app.search)
@@ -1626,7 +2362,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )
     } else {
         app.message.clone().unwrap_or_else(|| {
-            "/ search  u hidden  ! command  Click select  Double-click open  Wheel scroll  Esc/q close"
+            "/ search  u hidden  d diff  ! command  Click select  Double-click open  Wheel scroll  Esc/q close"
                 .to_string()
         })
     };
@@ -1670,5 +2406,94 @@ fn format_elapsed(elapsed: Duration) -> String {
         format!("{}h ago", secs / 3600)
     } else {
         format!("{}d ago", secs / 86_400)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw(code: &str, kind: DiffKind) -> RawDiffLine {
+        RawDiffLine {
+            code: code.to_string(),
+            kind,
+        }
+    }
+
+    fn render(line: &RawDiffLine) -> DiffLine {
+        let highlighter = Highlighter::new();
+        let syntax = highlighter.syntax_for("main.rs");
+        let syn_highlighter = SynHighlighter::new(&highlighter.theme);
+        let mut state = DiffHlState {
+            parse_old: ParseState::new(syntax),
+            parse_new: ParseState::new(syntax),
+            hl_old: HighlightState::new(&syn_highlighter, ScopeStack::new()),
+            hl_new: HighlightState::new(&syn_highlighter, ScopeStack::new()),
+        };
+        build_diff_line(line, &highlighter.syntax_set, &syn_highlighter, &mut state)
+    }
+
+    #[test]
+    fn added_line_gets_green_background_and_syntax_colors() {
+        let line = render(&raw("    let value: u32 = 1;", DiffKind::Add));
+        assert_eq!(line.bg, Some(ADD_BG));
+        // Every span (marker + code) carries the add background tint.
+        assert!(line.spans.iter().all(|span| span.style.bg == Some(ADD_BG)));
+        // Syntax highlighting should produce more than one foreground color.
+        let fg_colors: std::collections::HashSet<_> = line
+            .spans
+            .iter()
+            .skip(1)
+            .map(|span| format!("{:?}", span.style.fg))
+            .collect();
+        assert!(
+            fg_colors.len() > 1,
+            "expected multiple syntax colors, got {fg_colors:?}"
+        );
+    }
+
+    #[test]
+    fn removed_line_gets_red_background() {
+        let line = render(&raw("let y = 2;", DiffKind::Del));
+        assert_eq!(line.bg, Some(DEL_BG));
+    }
+
+    #[test]
+    fn context_line_has_no_background() {
+        let line = render(&raw("let z = 3;", DiffKind::Context));
+        assert_eq!(line.bg, None);
+    }
+
+    #[test]
+    fn parse_diff_body_drops_headers_and_classifies() {
+        let diff = "diff --git a/x.rs b/x.rs\n\
+                    index 1111111..2222222 100644\n\
+                    --- a/x.rs\n\
+                    +++ b/x.rs\n\
+                    @@ -1,2 +1,3 @@\n\
+                    \x20fn main() {}\n\
+                    +let x = 1;\n\
+                    \x20const Y: u8 = 2;\n";
+        let body = parse_diff_body(diff);
+        // File/hunk headers removed; the three body lines remain.
+        assert_eq!(body.len(), 3);
+        assert_eq!(body[0].kind, DiffKind::Context);
+        assert_eq!(body[1].kind, DiffKind::Add);
+        assert_eq!(body[1].code, "let x = 1;");
+        assert_eq!(body[2].kind, DiffKind::Context);
+    }
+
+    #[test]
+    fn change_blocks_group_consecutive_lines() {
+        let lines = vec![
+            raw("context", DiffKind::Context), // 0
+            raw("context", DiffKind::Context), // 1
+            raw("removed a", DiffKind::Del),   // 2 <- block start
+            raw("removed b", DiffKind::Del),   // 3
+            raw("added a", DiffKind::Add),     // 4 (still same block)
+            raw("context", DiffKind::Context), // 5
+            raw("added c", DiffKind::Add),     // 6 <- new block start
+        ];
+        assert_eq!(change_block_starts(&lines), vec![2, 6]);
     }
 }
