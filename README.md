@@ -14,6 +14,11 @@ untracked files are shown in red. The right pane also shows branch and status
 details, with mouse-wheel scrolling when the list is long. Click a file in the
 Git status panel to jump to its directory and select it in the file list.
 
+Press `d` inside a Git worktree to toggle diff mode: the left pane shows the
+full file with syntax highlighting and added/removed lines tinted green/red,
+while the right pane lists the changed files. Use `[`/`]` to jump between
+changes, `<`/`>` to switch files, and `j`/`k` to scroll.
+
 ## Install
 
 ```sh
@@ -122,6 +127,7 @@ Right click    Go to parent directory
 Wheel          Scroll file list
 Up/Down, k/j   Move selection
 u              Toggle hidden files
+d              Toggle git diff mode
 /              Search in current directory
 Up/Down in /   Move within search results
 !COMMAND       Run command here, then return to lscat
@@ -130,4 +136,14 @@ Left, h        Go to parent directory
 g/G            Jump to first/last item
 r              Refresh directory
 Esc, q         Close and return the current directory
+```
+
+In git diff mode:
+
+```text
+j/k            Scroll the diff
+[ / ]          Jump to previous/next change
+< / >          Previous/next changed file
+g/G            Jump to top/bottom
+Esc, q, d      Exit diff mode
 ```
